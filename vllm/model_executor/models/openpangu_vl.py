@@ -49,17 +49,18 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader 
 from vllm.model_executor.models.utils import (AutoWeightsLoader, WeightsMapper,
-                    init_vllm_registered_model, maybe_prefix,
-                    merge_multimodal_embeddings)
+                    init_vllm_registered_model, maybe_prefix)
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal.parse import MultiModalDataItems
-from vllm.multimodal.inputs import MultiModalKwargs
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalKwargsItems,
+)
 from vllm.multimodal.processing import PromptUpdate, PromptReplacement, PromptUpdateDetails
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
 from transformers.utils import logging
-from transformers import PretrainedConfig
 
 from vllm.model_executor.models.openpangu_processor_vl import OpenPanguVLProcessor
 from vllm.model_executor.models.openpangu import PanguEmbeddedForCausalLM
@@ -890,7 +891,7 @@ class OpenPanguVLMultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, any],
-        out_mm_kwargs: MultiModalKwargs,
+        out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         image_processor = self.info.get_image_processor(
@@ -1103,7 +1104,7 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
     
-    def get_multimodal_embeddings(
+    def embed_multimodal(
             self, **kwargs: object) -> Optional[MultiModalEmbeddings]:
 
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(
@@ -1130,7 +1131,7 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.embed_input_ids(input_ids)
         if multimodal_embeddings is not None:
-            inputs_embeds = merge_multimodal_embeddings(
+            inputs_embeds = self.embed_input_ids(
                 input_ids, inputs_embeds, multimodal_embeddings,
                 [self.config.image_token_id, self.config.video_token_id])
         return inputs_embeds
@@ -1144,7 +1145,7 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
         inputs_embeds = self.get_input_embeddings(input_ids)
         if image_input is not None:
             image_embeds = self._process_image_input(image_input)
-            inputs_embeds = merge_multimodal_embeddings(
+            inputs_embeds = self.embed_input_ids(
                 input_ids,
                 inputs_embeds,
                 image_embeds,
@@ -1153,7 +1154,7 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         if video_input is not None:
             video_embeds = self._process_video_input(video_input)
-            inputs_embeds = merge_multimodal_embeddings(
+            inputs_embeds = self.embed_input_ids(
                 input_ids,
                 inputs_embeds,
                 video_embeds,
@@ -1247,8 +1248,7 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
         hidden_states: torch.Tensor,
         sampling_metadata=None,
     ) -> Optional[torch.Tensor]:
-        return self.language_model.compute_logits(hidden_states,
-                                                  sampling_metadata)
+        return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
@@ -1275,20 +1275,21 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         raise ValueError("Only image or video modality is supported")
 
-    @classmethod
     def get_mrope_input_positions(
-        cls,
+        self,
         input_tokens: list[int],
-        hf_config: PretrainedConfig,
-        image_grid_thw: Union[list[list[int]], torch.Tensor],
-        video_grid_thw: Union[list[list[int]], torch.Tensor],
-        second_per_grid_ts: Optional[list[float]] = None,
-        context_len: int = 0,
-        seq_len: Optional[int] = None,
-        audio_feature_lengths: Optional[torch.Tensor] = None,
-        use_audio_in_video: bool = False,
+        mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[torch.Tensor, int]:
         """Get mrope input positions and delta value."""
+        kwargs = MultiModalFeatureSpec.gather_kwargs(
+            mm_features,
+            {"image_grid_thw", "video_grid_thw", "second_per_grid_ts"},
+        )
+        image_grid_thw = [item.tolist() for item in kwargs.get("image_grid_thw", [])]
+        video_grid_thw = [item.tolist() for item in kwargs.get("video_grid_thw", [])]
+        second_per_grid_ts = kwargs.get("second_per_grid_ts", [])
+
+        hf_config = self.config
         image_token_id = hf_config.image_token_id
         video_token_id = hf_config.video_token_id
         vision_start_token_id = hf_config.vision_start_token_id
@@ -1326,7 +1327,7 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 grid_hs = image_grid_thw[:, 1]
                 grid_ws = image_grid_thw[:, 2]
                 t_index = (torch.arange(grid_t) * 1 * tokens_per_second).long()
-                llm_pos_ids = cls._get_llm_pos_ids_for_vision(
+                llm_pos_ids = self._get_llm_pos_ids_for_vision(
                     start_idx, image_idx, spatial_merge_size, t_index, grid_hs, grid_ws
                 )
                 llm_pos_ids_list.append(llm_pos_ids)
@@ -1383,12 +1384,11 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         llm_positions = torch.cat(llm_pos_ids_list, dim=1)
         mrope_position_delta = torch.cat(llm_pos_ids_list, dim=1).max() + 1 - len(src_item)
-        llm_positions = llm_positions[:, context_len:seq_len]
 
         return llm_positions, mrope_position_delta
 
-    @staticmethod
     def _get_llm_pos_ids_for_vision(
+        self,
         start_idx: int,
         vision_idx: int,
         spatial_merge_size: int,
