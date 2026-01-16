@@ -18,7 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
+from functools import partial, lru_cache
 from typing import Callable, Literal, Optional, TypedDict, Union
 from collections.abc import Iterable, Mapping, Sequence
 import math
@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torchvision.transforms import v2
 
 from vllm.config import VllmConfig
 from vllm.distributed import parallel_state, tensor_model_parallel_all_gather
@@ -977,6 +978,7 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
         multimodal_config = vllm_config.model_config.multimodal_config
         self.use_data_parallel = getattr(vllm_config.parallel_config, 'enable_multimodal_encoder_data_parallel', False)
         self.config = config
+        self.vllm_config = vllm_config
         self.multimodal_config = multimodal_config
         quant_config = vllm_config.quant_config
         self.visual = OpenPanguVisionTransformer(
@@ -994,6 +996,18 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
             architectures=["PanguEmbeddedForCausalLM"],
         )
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+        self._parse_preprocess_params(config.vision_config)
+
+    def _parse_preprocess_params(self, vision_config):
+        self.channel = vision_config.in_channels
+        self.patch_size = vision_config.patch_size
+        from vllm.multimodal import MULTIMODAL_REGISTRY
+        processor = MULTIMODAL_REGISTRY.create_processor(self.vllm_config.model_config)
+        self.do_rescale = processor.info.get_hf_processor().image_processor.do_rescale
+        self.rescale_factor = processor.info.get_hf_processor().image_processor.rescale_factor
+        self.do_normalize = processor.info.get_hf_processor().image_processor.do_normalize
+        self.image_mean = tuple(processor.info.get_hf_processor().image_processor.image_mean)
+        self.image_std = tuple(processor.info.get_hf_processor().image_processor.image_std)
 
     def _maybe_ignore_quant_config(self, quant_config: QuantizationConfig):
             if isinstance(quant_config, (GPTQConfig, GPTQMarlinConfig)):
@@ -1171,6 +1185,11 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
         else:
             pixel_values = image_input["pixel_values"].type(self.visual.dtype)
+            # rescale and normalize
+            pixel_values = pixel_values.reshape(-1, self.channel, self.patch_size, self.patch_size)
+            pixel_values = rescale_and_normalize(pixel_values, self.do_rescale, self.rescale_factor, self.do_normalize,
+                                                 self.image_mean, self.image_std)
+            pixel_values = pixel_values.reshape(-1, self.channel * self.patch_size * self.patch_size)
             if self.use_data_parallel:
                 image_embeds = run_dp_sharded_mrope_vision_model(
                     self.visual, pixel_values, grid_thw, rope_type="rope_3d"
@@ -1409,3 +1428,57 @@ class OpenPanguVLForConditionalGeneration(nn.Module, SupportsMultiModal,
         llm_pos_ids_list.append(_llm_pos_ids + start_idx)
         llm_pos_ids = torch.cat(llm_pos_ids_list, dim=1)
         return llm_pos_ids
+
+
+def rescale(image, scale):
+    return image * scale
+
+
+def normalize(image, mean, std):
+    return v2.functional.normalize(image, mean, std)
+
+
+@lru_cache(maxsize=10)
+def _fuse_mean_std_and_rescale_factor(
+    do_normalize: Optional[bool] = None,
+    image_mean: Optional[Union[float, list[float]]] = None,
+    image_std: Optional[Union[float, list[float]]] = None,
+    do_rescale: Optional[bool] = None,
+    rescale_factor: Optional[float] = None,
+    device: Optional["torch.device"] = None,
+) -> tuple:
+    if do_rescale and do_normalize:
+        # Fused rescale and normalize
+        image_mean = torch.tensor(image_mean, device=device) * (1.0 / rescale_factor)
+        image_std = torch.tensor(image_std, device=device) * (1.0 / rescale_factor)
+        do_rescale = False
+    return image_mean, image_std, do_rescale
+
+
+def rescale_and_normalize(
+    images: "torch.Tensor",
+    do_rescale: bool,
+    rescale_factor: float,
+    do_normalize: bool,
+    image_mean: Union[float, list[float]],
+    image_std: Union[float, list[float]],
+) -> "torch.Tensor":
+    """
+    Rescale and normalize images.
+    """
+    image_mean, image_std, do_rescale = _fuse_mean_std_and_rescale_factor(
+        do_normalize=do_normalize,
+        image_mean=image_mean,
+        image_std=image_std,
+        do_rescale=do_rescale,
+        rescale_factor=rescale_factor,
+        device=images.device,
+    )
+    # if/elif as we use fused rescale and normalize if both are set to True
+    if do_normalize:
+        images = normalize(images.to(dtype=torch.float32), image_mean, image_std)
+    elif do_rescale:
+        images = rescale(images, rescale_factor)
+    images = images.to(torch.bfloat16)
+
+    return images
