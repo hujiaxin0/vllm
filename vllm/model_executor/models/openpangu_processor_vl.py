@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # Copyright 2025 The HuggingFace Inc. team
@@ -14,22 +16,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Union, Tuple
-from transformers.utils import logging
-from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor, Qwen2_5_VLProcessorKwargs
+import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
-from transformers.processing_utils import ImagesKwargs, ProcessingKwargs, ProcessorMixin, Unpack, VideosKwargs
+from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import (
+    Qwen2_5_VLProcessor,
+    Qwen2_5_VLProcessorKwargs,
+)
+from transformers.processing_utils import Unpack
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+from transformers.utils import logging
 from transformers.video_utils import VideoInput
 
 logger = logging.get_logger(__name__)
 
 
 class OpenPanguVLProcessor(Qwen2_5_VLProcessor):
-    tokenizer_class = ("AutoTokenizer")
+    tokenizer_class = "AutoTokenizer"
 
-    def __init__(self, image_processor=None, tokenizer=None, video_processor=None, chat_template=None, **kwargs):
+    def __init__(
+        self,
+        image_processor=None,
+        tokenizer=None,
+        video_processor=None,
+        chat_template=None,
+        **kwargs,
+    ):
         self.tokenizer = tokenizer
 
         self.image_token = "[unused19]"
@@ -65,7 +77,10 @@ class OpenPanguVLProcessor(Qwen2_5_VLProcessor):
     def __call__(
         self,
         images: ImageInput = None,
-        text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
+        text: TextInput
+        | PreTokenizedInput
+        | list[TextInput]
+        | list[PreTokenizedInput] = None,
         videos: VideoInput = None,
         **kwargs: Unpack[Qwen2_5_VLProcessorKwargs],
     ) -> BatchFeature:
@@ -79,7 +94,9 @@ class OpenPanguVLProcessor(Qwen2_5_VLProcessor):
         image_inputs = {}
         videos_inputs = {}
         if images is not None:
-            image_inputs = self.image_processor(images=images, **output_kwargs["images_kwargs"])
+            image_inputs = self.image_processor(
+                images=images, **output_kwargs["images_kwargs"]
+            )
             self._process_vision_placeholders(
                 text=text,
                 vision_token=self.image_token,
@@ -89,7 +106,9 @@ class OpenPanguVLProcessor(Qwen2_5_VLProcessor):
                 vision_end_token=self.vision_end_token,
             )
         if videos is not None:
-            videos_inputs = self.video_processor(videos=videos, **output_kwargs["videos_kwargs"])
+            videos_inputs = self.video_processor(
+                videos=videos, **output_kwargs["videos_kwargs"]
+            )
             self._process_vision_placeholders(
                 text=text,
                 vision_token=self.video_token,
@@ -99,7 +118,9 @@ class OpenPanguVLProcessor(Qwen2_5_VLProcessor):
                 vision_end_token=self.vision_end_token,
             )
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
-        return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", None)
+        return_mm_token_type_ids = output_kwargs["text_kwargs"].pop(
+            "return_mm_token_type_ids", None
+        )
         text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
         self._check_special_mm_tokens(text, text_inputs, modalities=["image", "video"])
 
@@ -109,19 +130,23 @@ class OpenPanguVLProcessor(Qwen2_5_VLProcessor):
             mm_token_type_ids[array_ids == self.image_token_id] = 1
             text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
 
-        return BatchFeature(data={**text_inputs, **image_inputs, **videos_inputs}, tensor_type=return_tensors)
+        return BatchFeature(
+            data={**text_inputs, **image_inputs, **videos_inputs},
+            tensor_type=return_tensors,
+        )
 
     @staticmethod
     def _process_vision_placeholders(
-        text: List[str],
+        text: list[str],
         vision_token: str,
-        grid_thw: List[Tuple[int, int, int]],
+        grid_thw: list[tuple[int, int, int]],
         merge_size: int,
         vision_start_token: str,
         vision_end_token: str,
     ) -> None:
         """
-        Replace placeholder tokens (e.g., <image> or <video>) in text with structured vision token sequences.
+        Replace placeholder tokens (e.g., <image> or <video>) in text with
+        structured vision token sequences.
         For images:
             - `grid_thw[i] = (1, H, W)` → treated as a single time slice.
         For videos:
@@ -153,8 +178,8 @@ class OpenPanguVLProcessor(Qwen2_5_VLProcessor):
                         f"Expected one (T, H, W) tuple per '{vision_token}' token."
                     )
                 grid_t, grid_h, grid_w = grid_thw[index]
-                # Calculate the sequence length per time slice based on the grid size and merge length.
-                seq_length_per_time = (grid_h * grid_w) // (merge_size ** 2)
+                # Calculate the sequence length per time slice based on the grid size and merge length. # noqa: E501
+                seq_length_per_time = (grid_h * grid_w) // (merge_size**2)
                 # Prepare a placeholder string that includes start and end tokens,
                 # and then calculate the number of media tokens to replace.
                 placeholder_string = (
@@ -163,7 +188,7 @@ class OpenPanguVLProcessor(Qwen2_5_VLProcessor):
                     + vision_end_token
                 )
                 if grid_t > 1:
-                    # For videos only, repeat the placeholder string for each time slice.
+                    # For videos only, repeat the placeholder string for each time slice. # noqa: E501
                     placeholder_string *= grid_t
                 placeholder_string = placeholder_string.removeprefix(vision_start_token)
                 placeholder_string = placeholder_string.removesuffix(vision_end_token)

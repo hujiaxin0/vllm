@@ -16,10 +16,10 @@ from .llama3_rope import Llama3RotaryEmbedding
 from .llama4_vision_rope import Llama4VisionRotaryEmbedding
 from .mrope import MRotaryEmbedding
 from .ntk_scaling_rope import NTKScalingRotaryEmbedding
+from .openpangu_rope import MRotaryEmbeddingInterleaved
 from .phi3_long_rope_scaled_rope import Phi3LongRoPEScaledRotaryEmbedding
 from .xdrope import XDRotaryEmbedding
 from .yarn_scaling_rope import YaRNScalingRotaryEmbedding
-from .openpangu_rope import MRotaryEmbeddingInterleaved
 
 _ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
 
@@ -297,6 +297,8 @@ def get_rope(
                 mrope_section=rope_parameters["mrope_section"],
                 mrope_interleaved=mrope_interleaved,
             )
+        else:
+            raise ValueError("Pangu mrope lacks necessary parameters.")
     else:
         raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
