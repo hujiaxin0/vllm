@@ -46,13 +46,13 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.parse import ImageProcessorItems, ImageSize, MultiModalDataItems
 from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptIndexTargets,
     PromptReplacement,
     PromptUpdate,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
@@ -129,7 +129,7 @@ class SiglipProcessingInfo(BaseProcessingInfo):
                 image_width=image_width,
                 image_height=image_height,
             ),
-            _get_vision_feature_select_strategy(pooler_config.pooling_type),
+            _get_vision_feature_select_strategy(pooler_config.seq_pooling_type),
         )
 
     def get_image_size_with_most_features(self) -> ImageSize:
@@ -690,9 +690,9 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
         hidden_state = self.mlp(hidden_state)
         hidden_state += residual
 
-        pooled = hidden_state[:, 0]
-
-        return pooled.unsqueeze(1)
+        # Handled by resolve_visual_encoder_outputs
+        # return hidden_state[:, 0]
+        return hidden_state
 
 
 class SiglipVisionTransformer(nn.Module):
@@ -998,7 +998,7 @@ class SiglipTextEmbeddings(nn.Module):
 
 
 # Assume EOS token corresponds to CLS token in text model
-@default_pooling_type("CLS")
+@default_pooling_type(seq_pooling_type="CLS")
 @MULTIMODAL_REGISTRY.register_processor(
     SiglipMultiModalProcessor,
     info=SiglipProcessingInfo,
@@ -1125,7 +1125,7 @@ class SiglipEmbeddingModel(nn.Module, SupportsMultiModal, SupportsQuant):
     ) -> torch.Tensor:
         if feature_select_strategy is None:
             feature_select_strategy = _get_vision_feature_select_strategy(
-                self.pooler_config.pooling_type
+                self.pooler_config.seq_pooling_type
             )
 
         pooled_output = self.vision_model(
