@@ -43,10 +43,11 @@ from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.utils import logging
 from transformers.video_utils import VideoInput
 
-from vllm.config import VllmConfig
+from vllm.config import MultiModalConfig, VllmConfig
 from vllm.distributed import parallel_state, tensor_model_parallel_all_gather
 from vllm.distributed import utils as dist_utils
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY, SiluAndMul
+from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -89,11 +90,9 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-try:
-    import flash_attn
-except (ImportError, ModuleNotFoundError):
-    flash_attn = None
+from .vision import get_vit_attn_backend
 
 logger = logging.get_logger(__name__)
 
@@ -105,10 +104,10 @@ class OpenPanguVisionAttention(nn.Module):
         num_heads: int,
         projection_size: int,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.embed_dim = embed_dim
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
@@ -133,7 +132,12 @@ class OpenPanguVisionAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.proj",
         )
-        self.scale_value = self.hidden_size_per_attention_head**-0.5
+        self.attn = MMEncoderAttention(
+            num_heads=self.num_attention_heads_per_partition,
+            head_size=self.hidden_size_per_attention_head,
+            scale=self.hidden_size_per_attention_head**-0.5,
+            multimodal_config=multimodal_config,
+        )
 
     def rotate_half(self, x):
         """Rotates half the hidden dims of the input."""
@@ -168,45 +172,16 @@ class OpenPanguVisionAttention(nn.Module):
         )
         q, k = self.apply_rotary_pos_emb(q, k, cos, sin)
 
-        if flash_attn is not None:
-            from flash_attn import flash_attn_varlen_func
-
-            q, k, v = [
-                rearrange(x, "b s h d -> (b s) h d").contiguous() for x in (q, k, v)
-            ]
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-            attn_out = flash_attn_varlen_func(
-                q,
-                k,
-                v,
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
-                dropout_p=0.0,
-                causal=False,
-            )
-
-            attn_out = rearrange(attn_out, "(b s) h d -> s (b h d)", b=1).contiguous()
-        else:
-            outputs = []
-            for i in range(1, len(cu_seqlens)):
-                start_idx = cu_seqlens[i - 1]
-                end_idx = cu_seqlens[i]
-                q_i = q[:, start_idx:end_idx]
-                k_i = k[:, start_idx:end_idx]
-                v_i = v[:, start_idx:end_idx]
-                q_i, k_i, v_i = (
-                    rearrange(x, "b s h d -> b h s d") for x in [q_i, k_i, v_i]
-                )
-                output_i = F.scaled_dot_product_attention(q_i, k_i, v_i, dropout_p=0.0)
-                output_i = rearrange(output_i, "b h s d -> b s h d ")
-                outputs.append(output_i)
-            context_layer = torch.cat(outputs, dim=1)
-            attn_out = rearrange(
-                context_layer, "b s h d -> s (b h d)", b=1
-            ).contiguous()
-        output, bias = self.proj(attn_out)
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        context_layer = self.attn(
+            query=q,
+            key=k,
+            value=v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        context_layer = rearrange(context_layer, "b s h d -> s (b h d)", b=1).contiguous()
+        output, bias = self.proj(context_layer)
         if bias is not None:
             output = output + bias
         return output
@@ -275,6 +250,7 @@ class OpenPanguVisionBlock(nn.Module):
         norm_layer: Callable[[int], nn.Module] | None = None,
         vision_config=None,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -287,6 +263,7 @@ class OpenPanguVisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             quant_config=quant_config,
+            multimodal_config=multimodal_config,
             prefix=f"{prefix}.attn",
         )
         self.mlp = OpenPanguVisionMLP(
@@ -424,6 +401,7 @@ class OpenPanguVisionTransformer(nn.Module):
         vision_config,
         norm_eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
+        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
         interleaved=False,
         use_data_parallel: bool = False,
@@ -446,6 +424,21 @@ class OpenPanguVisionTransformer(nn.Module):
             self.hidden_act = vision_config.hidden_act
 
             head_dim = self.hidden_size // self.num_heads
+            attn_backend_override = (
+                multimodal_config.mm_encoder_attn_backend if multimodal_config else None
+            )
+            self.attn_backend = get_vit_attn_backend(
+                head_size=head_dim,
+                dtype=torch.get_default_dtype(),
+                attn_backend_override=attn_backend_override,
+            )
+
+            if self.attn_backend not in {
+                AttentionBackendEnum.FLASH_ATTN,
+            }:
+                raise RuntimeError(
+                    f"Pangu-VL does not support {self.attn_backend} backend now."
+                )
             self.rotary_pos_emb = OpenPanguVisionRotaryEmbedding(head_dim // 2)
             self.patch_embed = OpenPanguVisionPatchEmbed(
                 patch_size=vision_config.patch_size,
@@ -463,6 +456,7 @@ class OpenPanguVisionTransformer(nn.Module):
                         vision_config=vision_config,
                         norm_layer=norm_layer,
                         quant_config=quant_config,
+                        multimodal_config=multimodal_config,
                         prefix=f"{prefix}.blocks.{layer_idx}",
                     )
                     for layer_idx in range(vision_config.depth)
@@ -610,7 +604,7 @@ class OpenPanguVisionTransformer(nn.Module):
         # compute cu_seqlens
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).to(torch.int32)
+        ).to(torch.int32).to(x.device)
         cu_seqlens = torch.cumsum(cu_seqlens, dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
@@ -1089,6 +1083,7 @@ class OpenPanguVLForConditionalGeneration(
             vision_config=config.vision_config,
             norm_eps=getattr(config.vision_config, "rms_norm_eps", 1e-6),
             quant_config=self._maybe_ignore_quant_config(quant_config),
+            multimodal_config = multimodal_config,
             prefix=maybe_prefix(prefix, "visual"),
             use_data_parallel=self.use_data_parallel,
         )
