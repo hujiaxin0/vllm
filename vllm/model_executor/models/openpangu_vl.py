@@ -1626,7 +1626,7 @@ def rescale_and_normalize(
     do_normalize: bool,
     image_mean: float | list[float],
     image_std: float | list[float],
-    target_dtype: str = "torch.bfloat16",
+    dtype: torch.dtype = torch.bfloat16,
 ) -> "torch.Tensor":
     """
     Rescale and normalize images.
@@ -1644,6 +1644,6 @@ def rescale_and_normalize(
         images = normalize(images.to(dtype=torch.float32), image_mean, image_std)
     elif do_rescale:
         images = rescale(images, rescale_factor)
-    images = images.to(target_dtype)
+    images = images.to(dtype)
 
     return images
