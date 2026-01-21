@@ -40,7 +40,7 @@ from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY, SiluAndM
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
-    ColumarallelLinear,
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
