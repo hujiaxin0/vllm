@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import warnings
 from abc import abstractmethod
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, cast
