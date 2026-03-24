@@ -559,6 +559,8 @@ class OutputProcessor:
             prompt=prompt,
             prompt_token_ids=request.prompt_token_ids,
             arrival_time=request.arrival_time,
+            max_tokens_param=max_tokens_param,
+            output_kind=output_kind,
         )
 
         # Apply request updates now if the last input already completed.
