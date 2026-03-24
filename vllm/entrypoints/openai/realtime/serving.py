@@ -81,8 +81,23 @@ class OpenAIServingRealtime(OpenAIServing):
             ),
         )
 
-        async for prompt in stream_input_iter:
+        from vllm.sampling_params import RequestOutputKind, SamplingParms
+        sampling_params = SamplingParams.from_optional(
+            temperature=0.0,
+            max_tokens=128,
+            seed=1234,
+            top_k=1,
+            top_p=0.0001,
+            repetition_penalty=1.05,
+            output_kind=RequestOutputKind.DELTA,
+            skip_clone=True,
+        )
+
+        async for prompt is_final in stream_input_iter:
             parsed_prompt = parse_model_prompt(model_config, prompt)
             (engine_prompt,) = await renderer.render_cmpl_async([parsed_prompt])
 
-            yield StreamingInput(prompt=engine_prompt)
+            if is_final:
+                yield StreamingInput(prompt=engine_prompt, sampling_params=sampling_params)
+            else:
+                yield StreamingInput(prompt=engine_prompt)
