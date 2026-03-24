@@ -124,6 +124,8 @@ class StreamingUpdate:
     prompt_token_ids: list[int] | None
     arrival_time: float
     final: bool = False
+    max_tokens_param: int | None = None
+    output_kind: RequestOutputKind | None = None
 
 
 class RequestState:
