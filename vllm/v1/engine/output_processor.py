@@ -557,6 +557,8 @@ class OutputProcessor:
                 req_state.streaming_input = False
             return
 
+        max_tokens_param = request.sampling_params.max_tokens if request.sampling_params else None
+        output_kind = request.sampling_params.output_kind if request.sampling_params else None
         update = StreamingUpdate(
             prompt=prompt,
             prompt_token_ids=request.prompt_token_ids,
